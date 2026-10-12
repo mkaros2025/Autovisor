@@ -208,3 +208,68 @@ class OptimizePageTests(LoggerPatchMixin, unittest.IsolatedAsyncioTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class _FakeModalIcon:
+    """模拟遮罩弹窗的关闭图标。"""
+
+    def __init__(self, visible=True, click_error=None, js_error=None):
+        self.visible = visible
+        self.click_error = click_error
+        self.js_error = js_error
+        self.clicks = 0
+        self.js_clicks = 0
+
+    async def count(self):
+        return 1 if self.visible else 0
+
+    async def is_visible(self):
+        return self.visible
+
+    async def click(self, **_kwargs):
+        self.clicks += 1
+        if self.click_error:
+            raise self.click_error
+        self.visible = False
+
+    async def evaluate(self, _script):
+        self.js_clicks += 1
+        if self.js_error:
+            raise self.js_error
+        self.visible = False
+
+    @property
+    def first(self):
+        return self
+
+
+class _FakePage:
+    def __init__(self, icon):
+        self.icon = icon
+        self.waits = []
+
+    def locator(self, _selector):
+        return self.icon
+
+    async def wait_for_timeout(self, ms):
+        self.waits.append(ms)
+
+
+class BlockingModalTests(unittest.IsolatedAsyncioTestCase):
+    async def test_returns_zero_when_no_modal_is_visible(self):
+        icon = _FakeModalIcon(visible=False)
+        self.assertEqual(await utils.close_blocking_modal(_FakePage(icon)), 0)
+        self.assertEqual(icon.clicks, 0)
+
+    async def test_closes_visible_modal_once(self):
+        icon = _FakeModalIcon()
+        self.assertEqual(await utils.close_blocking_modal(_FakePage(icon)), 1)
+        self.assertEqual(icon.clicks, 1)
+
+    async def test_covered_close_control_is_not_force_clicked(self):
+        # 关闭控件被遮挡时不再用页面脚本强点(可能误关未知弹窗), 只报告关不掉
+        icon = _FakeModalIcon(click_error=PlaywrightTimeoutError("covered"))
+        page = _FakePage(icon)
+        self.assertEqual(await utils.close_blocking_modal(page), 0)
+        self.assertEqual(icon.js_clicks, 0)
+        self.assertTrue(await utils.blocking_modal_visible(page))

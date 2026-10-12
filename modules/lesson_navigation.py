@@ -16,6 +16,10 @@ class CatalogSelectors:
     progress: str | None = None
     progress_attribute: str | None = None
     course_title: str | None = None
+    # 真正可点击的课时行。item 是课时项的容器, 其中心点未必落在可点击区域
+    # (融合课的 .chapter-item 中心落在小节标题与课时行之间的空隙, 点它不会切换课时),
+    # 因此需要单独声明点击目标; 为 None 时直接点击 item。
+    click: str | None = None
 
 
 WISDOM_CATALOG = CatalogSelectors(
@@ -45,6 +49,9 @@ FUSION_CATALOG = CatalogSelectors(
     # 补上后 lesson_progress 能读到中间值, 支撑"播完未到100->回退重播"上报。
     progress=".el-progress",
     progress_attribute="aria-valuenow",
+    # 真站实测: .chapter-item = 小节标题(.item-box) + 课时行(.chapter-content-second),
+    # 容器中心落在两行之间的空隙上, 点击容器不会切换课时; 必须点课时行本身。
+    click=".chapter-content-second",
 )
 
 HIKE_CATALOG = CatalogSelectors(
@@ -147,23 +154,57 @@ async def wait_for_lesson_completion(
     return False
 
 
+async def resolve_lesson_click_target(
+    lesson: Locator, catalog: CatalogSelectors
+) -> tuple[Locator | None, str | None]:
+    """返回真正可点击的课时元素。
+
+    item 只是课时项的容器: 融合课的 .chapter-item 中心落在小节标题(.item-box)与
+    课时行(.chapter-content-second)之间的空隙上, 点击容器不会切换课时(既不报错也不生效),
+    会让 wait_for_lesson_active 超时。catalog.click 命中恰好 1 个子元素时改点它;
+    未命中时保持原行为点容器; 命中多个时明确失败, 避免点错课时。
+    """
+    if not catalog.click:
+        return lesson, None
+    rows = lesson.locator(catalog.click)
+    try:
+        count = await rows.count()
+    except Exception as exc:
+        return None, f"统计课时行失败({catalog.click}): {exc}"
+    if count == 1:
+        return rows.first, None
+    if count == 0:
+        return lesson, None
+    return None, f"课时项内匹配到 {count} 个 {catalog.click}, 无法确定点击目标"
+
+
+async def lesson_is_active(lesson: Locator, catalog: CatalogSelectors) -> bool:
+    """课时当前是否处于激活状态。
+
+    一些目录结构(如融合课)的"当前激活"标识挂在课时内部子节点上
+    (例如 .chapter-item 内的 .chapter-content-second.current), 课时自身无 active class,
+    因此除了检查本节点 active_class, 还需回退检查内部是否命中 catalog.active。
+    """
+    try:
+        if has_class(await lesson.get_attribute("class"), catalog.active_class):
+            return True
+    except Exception:
+        return False
+    if not catalog.active:
+        return False
+    try:
+        return await lesson.locator(catalog.active).count() > 0
+    except Exception:
+        return False
+
+
 async def wait_for_lesson_active(
     lesson: Locator, catalog: CatalogSelectors, timeout_ms: int = 8_000
 ) -> bool:
     deadline = asyncio.get_running_loop().time() + timeout_ms / 1000
-    # 一些目录结构(如融合课)的"当前激活"标识挂在课时内部子节点上
-    # (例如 .chapter-item 内的 .chapter-content-second.current), 课时自身无 active class,
-    # 因此除了检查本节点 active_class, 还需回退检查内部是否命中 catalog.active。
-    has_active_descendant = bool(catalog.active)
     while asyncio.get_running_loop().time() < deadline:
-        if has_class(await lesson.get_attribute("class"), catalog.active_class):
+        if await lesson_is_active(lesson, catalog):
             return True
-        if has_active_descendant:
-            try:
-                if await lesson.locator(catalog.active).count() > 0:
-                    return True
-            except Exception:
-                has_active_descendant = False
         await asyncio.sleep(0.2)
     return False
 

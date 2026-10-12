@@ -225,16 +225,52 @@ async def evaluate_on_element(page: Page, selector: str, js: str, timeout: float
         return
 
 
+# 会拦截点击的遮罩弹窗("学前必读"/"课程提醒"): 只在特定条件下出现, 但出现时必须先关掉,
+# 否则课时行点不动(Playwright 会一直重试到超时)。平台会在课程中途(如进入新章节)再次弹出,
+# 因此不能只在课程开始时关一次。
+BLOCKING_MODAL_SELECTOR = ".ss2077-custom-modal"
+BLOCKING_MODAL_CLOSE_ICON = (
+    f"{BLOCKING_MODAL_SELECTOR} .ss2077-custom-dialog:visible "
+    ".ss2077-custom-title > img.icon"
+)
+
+
+async def blocking_modal_visible(page: Page) -> bool:
+    """是否仍有可见的遮罩弹窗(关闭控件可能存在但点不动)。"""
+    try:
+        icon = page.locator(BLOCKING_MODAL_CLOSE_ICON).first
+        return bool(await icon.count()) and await icon.is_visible()
+    except Exception:
+        return False
+
+
+async def close_blocking_modal(page: Page, attempts: int = 3) -> int:
+    """用可见且可操作的关闭控件关掉遮罩弹窗, 返回实际关闭次数。
+
+    关闭控件被遮挡时**不再**用页面脚本强点: 那可能误关未知弹窗。
+    关不掉的情况由调用方记录并报告。
+    """
+    closed = 0
+    for _ in range(attempts):
+        icon = page.locator(BLOCKING_MODAL_CLOSE_ICON).first
+        try:
+            if not await icon.count() or not await icon.is_visible():
+                break
+            await icon.click(timeout=2000)
+        except TargetClosedError:
+            break
+        except Exception:
+            break
+        closed += 1
+        await page.wait_for_timeout(400)
+    return closed
+
+
 async def optimize_page(
     page: Page, config: Config, catalog: CatalogSelectors
 ) -> None:
     try:
-        preread_close = page.locator(
-            ".ss2077-custom-modal .ss2077-custom-dialog:visible "
-            ".ss2077-custom-title > img.icon"
-        ).first
-        if await preread_close.count() and await preread_close.is_visible():
-            await preread_close.click(timeout=2000)
+        if await close_blocking_modal(page):
             logger.info("已关闭学前必读弹窗.")
 
         if catalog.name == "legacy":

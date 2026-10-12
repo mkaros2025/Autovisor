@@ -1,17 +1,30 @@
 import time
 from enum import Enum
 
-from playwright.async_api import Page
+from playwright.async_api import Page, TimeoutError
 
-from modules.course_playback import elapsed_minutes, learn_lesson, review_lesson
+from modules.course_playback import (
+    elapsed_minutes,
+    learn_lesson,
+    read_media_state,
+    review_lesson,
+    wait_for_lesson_media,
+)
 from modules.lesson_navigation import (
     CatalogSelectors,
     detect_catalog,
+    lesson_is_active,
     lesson_progress,
+    resolve_lesson_click_target,
     wait_for_lesson_active,
 )
 from modules.tasks import has_visible_verification, wait_until_verification_hidden
-from modules.utils import get_filtered_class, get_lesson_name
+from modules.utils import (
+    blocking_modal_visible,
+    close_blocking_modal,
+    get_filtered_class,
+    get_lesson_name,
+)
 from modules.fusion_adapter import FusionAdapter
 
 # 课时项(<li>)的点击发生在 set_default_timeout(10000) 之前, 不显式限时就会沿用
@@ -26,6 +39,23 @@ class CourseOutcome(Enum):
     COMPLETED = "completed"
     TIME_LIMIT = "time_limit"
     FAILED = "failed"
+
+
+async def click_lesson_target(target, position: str, logger) -> bool:
+    """点击课时行; 被遮罩拦截/超时时不抛异常, 返回 False 交给上层重试。
+
+    真站上"学前必读/课程提醒"遮罩会在课程中途再次弹出, 直接点击会一直重试到
+    10 秒超时并抛 TimeoutError; 不处理就会把整轮运行带崩。
+    """
+    try:
+        await target.click(timeout=LESSON_CLICK_TIMEOUT_MS)
+        return True
+    except TimeoutError as exc:
+        logger.warn("课时点击被拦截或超时.", shift=True)
+        logger.event(
+            "课时点击失败", 序号=position, 原因=logger.summarize_exception(exc)
+        )
+        return False
 
 
 async def detect_catalog_after_verification(
@@ -84,8 +114,30 @@ async def run_course(
     for index, lesson in enumerate(lessons):
         position = f"{index + 1}/{len(lessons)}"
         playback_enabled.clear()
-        await lesson.click(timeout=LESSON_CLICK_TIMEOUT_MS)
-        active = await wait_for_lesson_active(lesson, catalog)
+        click_target, click_error = await resolve_lesson_click_target(lesson, catalog)
+        if click_target is None:
+            logger.error(f"无法选中课时,目录类型: {catalog.name}")
+            logger.event(
+                "课程结果", 结果="课时无法选中", 序号=position, 原因=click_error
+            )
+            return CourseOutcome.FAILED
+        # 切换前先固定基准: 目标课时是否已激活 + 当前 <video> 的媒体状态。
+        # 播放器会复用同一个 video 元素, 切换瞬间仍带着上一课时的 duration/currentTime,
+        # 不记录基准就无法分辨"新课时媒体已加载"与"上一课时的残留元数据"。
+        target_was_active = await lesson_is_active(lesson, catalog)
+        media_before = await read_media_state(page, logger)
+        if media_before is None:
+            # 快照读取失败时没有可比基准, 再试一次; 仍失败则明确失败而不是拿旧时长凑数
+            media_before = await read_media_state(page, logger)
+        closed = await close_blocking_modal(page)
+        if closed:
+            logger.info(f"已关闭 {closed} 个拦截弹窗.")
+            logger.event("拦截弹窗", 序号=position, 关闭数=closed)
+        elif await blocking_modal_visible(page):
+            logger.warn("存在无法关闭的遮罩弹窗,课时可能点不动.", shift=True)
+            logger.event("拦截弹窗", 序号=position, 结果="无法关闭")
+        clicked = await click_lesson_target(click_target, position, logger)
+        active = clicked and await wait_for_lesson_active(lesson, catalog)
         if not active:
             logger.warn("课时切换超时,正在重试一次.", shift=True)
             logger.event(
@@ -94,8 +146,12 @@ async def run_course(
                 目录类型=catalog.name,
                 选择器=catalog.active,
             )
-            await lesson.click(timeout=LESSON_CLICK_TIMEOUT_MS)
-            active = await wait_for_lesson_active(lesson, catalog)
+            # 首次点击可能只是把"学前必读"弹窗点出来: 关掉它再点一次才会真的切课时
+            closed = await close_blocking_modal(page)
+            if closed:
+                logger.event("拦截弹窗", 序号=position, 关闭数=closed, 阶段="重试前")
+            clicked = await click_lesson_target(click_target, position, logger)
+            active = clicked and await wait_for_lesson_active(lesson, catalog)
         if not active:
             logger.error(f"无法选中课时,目录类型: {catalog.name}")
             logger.event("课程结果", 结果="课时无法选中", 序号=position)
@@ -117,13 +173,30 @@ async def run_course(
         await page.wait_for_selector("video", state="attached")
         playback_enabled.set()
 
+        total_time, media_paused, validated_media = await wait_for_lesson_media(
+            page, media_before, target_was_active, logger
+        )
+        if total_time is None:
+            logger.error("无法确认新课时的视频元数据,停止本轮运行.", shift=True)
+            logger.event("课程结果", 结果="视频元数据未就绪", 序号=position)
+            return CourseOutcome.FAILED
+        paused_time += media_paused
+
         if learning:
             added_pause, completed, reached_limit = await learn_lesson(
-                page, start_time, paused_time, lesson, catalog, config, logger
+                page,
+                start_time,
+                paused_time,
+                lesson,
+                catalog,
+                config,
+                logger,
+                total_time,
+                validated_media,
             )
         else:
             added_pause, completed, reached_limit = await review_lesson(
-                page, start_time, paused_time, config, logger
+                page, start_time, paused_time, config, logger, total_time, validated_media
             )
         paused_time += added_pause
 
