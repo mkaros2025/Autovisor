@@ -26,6 +26,9 @@ env:
   # 必须落在 modules/installer.SUPPORTED_PYTHON (3.10-3.13) 内, 否则打出来的
   # Autovisor.exe 会在启动时拒绝运行; 3.12 与 macos-smoke 保持一致。
   PYTHON_VERSION: "3.12"
+  # Windows runner 的控制台是 cp1252, 而日志/--help 文本含中文, 不开 UTF-8 模式
+  # 就会在 print 时抛 UnicodeEncodeError(单元测试和 exe 冒烟都会中招)
+  PYTHONUTF8: "1"
 
 jobs:
   build:
