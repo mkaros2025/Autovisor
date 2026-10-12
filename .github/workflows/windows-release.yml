@@ -1,0 +1,153 @@
+name: Windows Release
+
+# 打版本 tag (如 3.18.5) 时在 Windows 上打包 Autovisor.exe 并上传到同名 Release;
+# 也可在 Actions 页面手动触发: 填 tag 走完整发布流程, 留空则只构建并产出 artifact。
+
+on:
+  push:
+    tags:
+      - '[0-9]+.[0-9]+.[0-9]+'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "要发布的版本 tag (如 3.18.5); 留空则只构建, 不创建/上传 Release"
+        required: false
+        type: string
+
+# gh release create/upload 需要写权限; 本仓库默认 token 是只读, 必须显式声明
+permissions:
+  contents: write
+
+concurrency:
+  group: windows-release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  # 必须落在 modules/installer.SUPPORTED_PYTHON (3.10-3.13) 内, 否则打出来的
+  # Autovisor.exe 会在启动时拒绝运行; 3.12 与 macos-smoke 保持一致。
+  PYTHON_VERSION: "3.12"
+
+jobs:
+  build:
+    name: build windows-amd64
+    runs-on: windows-latest
+    timeout-minutes: 45
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v10.1.0
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          enable-cache: true
+
+      - name: Install dependencies (incl. captcha extra)
+        run: uv sync --extra captcha
+
+      - name: Unit tests
+        run: uv run python -m unittest discover -s tests -v
+
+      - name: Resolve version from modules/version.py
+        id: version
+        shell: pwsh
+        run: |
+          $version = (uv run --no-sync python -c "from modules.version import __version__; print(__version__)").Trim()
+          if ($version -notmatch '^\d+\.\d+\.\d+$') {
+            throw "modules/version.py 的版本号格式异常: '$version'"
+          }
+
+          # tag 推送用 github.ref_name, 手动触发用 inputs.tag
+          $tag = "${{ inputs.tag }}".Trim()
+          if (-not $tag -and "${{ github.ref_type }}" -eq 'tag') { $tag = "${{ github.ref_name }}" }
+          $tag = $tag.TrimStart('v')
+
+          # tag 与版本号不一致就停: 否则会打出名字对、内容错的发行包
+          if ($tag -and $tag -ne $version) {
+            throw "tag '$tag' 与 modules/version.py 的 '$version' 不一致, 请先同步版本号"
+          }
+
+          "version=$version" >> $env:GITHUB_OUTPUT
+          "tag=$tag" >> $env:GITHUB_OUTPUT
+          if ($tag) { Write-Host "版本: $version, 发布 tag: $tag" }
+          else { Write-Host "版本: $version, 仅构建(不发布 Release)" }
+
+      - name: Build Autovisor.exe (PyInstaller)
+        run: uv run --with pyinstaller python build.py
+
+      - name: Verify the packaged directory
+        shell: pwsh
+        run: |
+          # build.py 在找不到 python3.dll 时只打印 WARNING, 而缺了它发行版会在
+          # "import cv2" 时报 DLL load failed, 所以这里当硬失败处理
+          $required = @(
+            'Autovisor.exe',
+            'config.ini',
+            'data/mirrors.json',
+            'resources/QRcode.jpg',
+            'resources/stealth.min.js',
+            'internal/python3.dll'
+          ) | ForEach-Object { Join-Path 'dist/Autovisor' $_ }
+
+          $missing = @($required | Where-Object { -not (Test-Path -LiteralPath $_) })
+          if ($missing.Count) { throw "打包产物缺少必需文件: $($missing -join ', ')" }
+          Write-Host "产物校验通过: $($required.Count) 项必需文件齐全"
+
+      - name: Smoke test the frozen exe
+        shell: pwsh
+        run: |
+          # --help 在 argparse 阶段就退出, 不碰浏览器/网络/登录, 但足以证明
+          # PyInstaller 包里 playwright/PIL/requests 等依赖都能正常导入
+          $output = & ./dist/Autovisor/Autovisor.exe --help 2>&1 | Out-String
+          if ($LASTEXITCODE -ne 0) {
+            Write-Host $output
+            throw "Autovisor.exe --help 退出码 $LASTEXITCODE"
+          }
+          if ($output -notmatch '--check-course') {
+            Write-Host $output
+            throw "Autovisor.exe --help 输出异常"
+          }
+          Write-Host $output
+
+      - name: Zip the release package
+        id: package
+        shell: pwsh
+        run: |
+          $zip = "Autovisor-${{ steps.version.outputs.version }}-windows-amd64.zip"
+          # 打包目录内容而不是 dist/Autovisor 这层目录, 与 Release 里现有资产一致:
+          # 解压后 Autovisor.exe 就在根目录
+          Compress-Archive -Path 'dist/Autovisor/*' -DestinationPath $zip -CompressionLevel Optimal
+          "zip=$zip" >> $env:GITHUB_OUTPUT
+          Write-Host "已生成 $zip ($([math]::Round((Get-Item $zip).Length / 1MB, 1)) MB)"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: ${{ steps.package.outputs.zip }}
+          path: ${{ steps.package.outputs.zip }}
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Publish to the Release
+        if: steps.version.outputs.tag != ''
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $tag = "${{ steps.version.outputs.tag }}"
+          $zip = "${{ steps.package.outputs.zip }}"
+
+          gh release view $tag --repo $env:GITHUB_REPOSITORY *> $null
+          if ($LASTEXITCODE -ne 0) {
+            Write-Host "Release $tag 不存在, 自动创建"
+            # --verify-tag: tag 不在远端就直接失败, 避免把 Release 建在默认分支的错误位置上
+            gh release create $tag --repo $env:GITHUB_REPOSITORY --verify-tag `
+              --title "Autovisor-$tag" --generate-notes
+            if ($LASTEXITCODE -ne 0) { throw "创建 Release $tag 失败" }
+          }
+
+          gh release upload $tag $zip --repo $env:GITHUB_REPOSITORY --clobber
+          if ($LASTEXITCODE -ne 0) { throw "上传 $zip 到 Release $tag 失败" }
+          Write-Host "已发布: $(gh release view $tag --repo $env:GITHUB_REPOSITORY --json url --jq .url)"
