@@ -39,6 +39,7 @@ from modules.tasks import (
 )
 from modules.utils import (
     clear_cookies,
+    enable_lossy_stdio,
     get_runtime_path,
     hide_window,
     load_cookies,
@@ -46,6 +47,10 @@ from modules.utils import (
     save_cookies,
 )
 from modules.version import __version__
+
+# stdout/stderr 被重定向时 Windows 会退回 locale 编码, 中文日志和 --help 文本会让
+# 程序直接崩掉; 必须在 argparse 打印帮助之前放宽 errors。详见 utils.enable_lossy_stdio。
+enable_lossy_stdio(sys.stdout, sys.stderr)
 
 # 获取全局事件循环
 event_loop_verify = asyncio.Event()

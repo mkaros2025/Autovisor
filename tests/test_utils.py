@@ -1,3 +1,4 @@
+import io
 import unittest
 from unittest import mock
 
@@ -273,3 +274,38 @@ class BlockingModalTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(await utils.close_blocking_modal(page), 0)
         self.assertEqual(icon.js_clicks, 0)
         self.assertTrue(await utils.blocking_modal_visible(page))
+
+
+class EnableLossyStdioTests(unittest.TestCase):
+    """重定向 + locale 编不了中文时, 打印不该把进程带走。"""
+
+    @staticmethod
+    def _cp1252_stream():
+        # cp1252 编不出中文, 是 Windows 英文 locale 下重定向 stdout 的真实编码
+        return io.TextIOWrapper(io.BytesIO(), encoding="cp1252")
+
+    def test_cp1252_stream_raises_before_hardening(self):
+        with self.assertRaises(UnicodeEncodeError):
+            self._cp1252_stream().write("课时失败")
+
+    def test_cp1252_stream_stops_raising_after_hardening(self):
+        stream = self._cp1252_stream()
+        utils.enable_lossy_stdio(stream)
+        stream.write("课时失败")
+        stream.flush()
+
+    def test_encoding_is_kept_so_console_output_does_not_change(self):
+        stream = self._cp1252_stream()
+        utils.enable_lossy_stdio(stream)
+        self.assertEqual(stream.encoding, "cp1252")
+        self.assertEqual(stream.errors, "replace")
+        stream.write("ok")
+        stream.flush()
+
+    def test_none_and_unreconfigurable_streams_are_ignored(self):
+        utils.enable_lossy_stdio(None, object())
+
+    def test_closed_stream_does_not_break_startup(self):
+        stream = self._cp1252_stream()
+        stream.close()
+        utils.enable_lossy_stdio(stream)

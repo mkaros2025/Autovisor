@@ -33,6 +33,25 @@ logger = Logger()
 OPTIONAL_POPUP_TIMEOUT_MS = 20_000
 
 
+def enable_lossy_stdio(*streams) -> None:
+    """让编不出来的字符退化为替换字符, 而不是抛 UnicodeEncodeError。
+
+    Windows 上 stdout/stderr 被重定向(管道、文件)时, 解释器会退回系统 locale 编码
+    (cp1252/cp936), 而日志与 --help 文本含中文: 编不出来就会直接崩掉一个进程
+    (打包版 stdout 只有重定向时才走这条路, 控制台里用的是 WriteConsoleW 不受影响)。
+    这里只放宽 errors, 不动 encoding, 所以中文控制台的显示效果保持不变。
+    """
+    for stream in streams:
+        if stream is None:
+            continue
+        try:
+            stream.reconfigure(errors="replace")
+        except (AttributeError, ValueError, OSError):
+            # 被替换过的/已关闭的/不支持 reconfigure 的流保持原样: 加固失败不该反过来
+            # 让程序启动不了
+            pass
+
+
 def get_runtime_root():
     return logger.runtime_root
 
