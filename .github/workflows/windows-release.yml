@@ -134,6 +134,8 @@ jobs:
               throw "Autovisor.exe --help 失败, 退出码 $code"
             }
             Write-Host "::warning::该提交尚未包含 utils.enable_lossy_stdio: 重定向输出时打印中文会崩(旧版本行为), 但依赖导入与启动流程已验证通过"
+            # GitHub 会在步骤末尾追加 exit $LASTEXITCODE, 不显式退出就会把 exe 的 1 带出去
+            exit 0
           }
 
       - name: Zip the release package
