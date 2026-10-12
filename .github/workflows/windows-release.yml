@@ -97,7 +97,22 @@ jobs:
 
           $missing = @($required | Where-Object { -not (Test-Path -LiteralPath $_) })
           if ($missing.Count) { throw "打包产物缺少必需文件: $($missing -join ', ')" }
-          Write-Host "产物校验通过: $($required.Count) 项必需文件齐全"
+
+          # 发行包里只能有示例配置: 防止将来 build.py 改动把本机的 config.ini
+          # (含账号、密码、课程链接) 打进发行包。两边都归一化换行后再比。
+          $packaged = (Get-Content -Raw 'dist/Autovisor/config.ini') -replace "`r`n", "`n"
+          $example = (Get-Content -Raw 'config.ini.example') -replace "`r`n", "`n"
+          if ($packaged -ne $example) {
+            throw "dist 里的 config.ini 与 config.ini.example 不一致, 拒绝发布"
+          }
+
+          # 登录态与运行日志也不该进发行包
+          $forbidden = @('data/cookies.json', 'data/user-data', 'logs', 'config.ini.local') |
+            ForEach-Object { Join-Path 'dist/Autovisor' $_ }
+          $leaked = @($forbidden | Where-Object { Test-Path -LiteralPath $_ })
+          if ($leaked.Count) { throw "发行包含不该发布的内容: $($leaked -join ', ')" }
+
+          Write-Host "产物校验通过: $($required.Count) 项必需文件齐全, config.ini 确认仅为示例模板"
 
       - name: Smoke test the frozen exe
         shell: pwsh
@@ -105,15 +120,21 @@ jobs:
           # --help 在 argparse 阶段就退出, 不碰浏览器/网络/登录, 但足以证明
           # PyInstaller 包里 playwright/PIL/requests 等依赖都能正常导入
           $output = & ./dist/Autovisor/Autovisor.exe --help 2>&1 | Out-String
-          if ($LASTEXITCODE -ne 0) {
-            Write-Host $output
-            throw "Autovisor.exe --help 退出码 $LASTEXITCODE"
-          }
-          if ($output -notmatch '--check-course') {
-            Write-Host $output
-            throw "Autovisor.exe --help 输出异常"
-          }
+          $code = $LASTEXITCODE
           Write-Host $output
+
+          if (-not ($code -eq 0 -and $output -match '--check-course')) {
+            # 重建历史 tag 时会碰上当时还没修的 cp1252 打印崩溃: traceback 能走到
+            # parse_args 就说明依赖导入与启动流程是通的, 这种情况只告警放行。
+            # 但源码里已有加固却仍崩(或出现导入/DLL 错误)一律硬失败, 不放过回归。
+            $hardened = Select-String -Quiet -Path 'Autovisor.py' -Pattern 'enable_lossy_stdio'
+            $knownPrintCrash = $output -match 'UnicodeEncodeError' -and $output -match 'parse_args'
+            $fatal = $output -match 'ModuleNotFoundError|ImportError|DLL load failed'
+            if ($hardened -or -not $knownPrintCrash -or $fatal) {
+              throw "Autovisor.exe --help 失败, 退出码 $code"
+            }
+            Write-Host "::warning::该提交尚未包含 utils.enable_lossy_stdio: 重定向输出时打印中文会崩(旧版本行为), 但依赖导入与启动流程已验证通过"
+          }
 
       - name: Zip the release package
         id: package
