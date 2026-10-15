@@ -15,7 +15,6 @@ from modules.lesson_navigation import (
     detect_catalog,
     lesson_is_active,
     lesson_progress,
-    resolve_lesson_click_target,
     wait_for_lesson_active,
 )
 from modules.tasks import has_visible_verification, wait_until_verification_hidden
@@ -87,7 +86,8 @@ async def run_course(
     await page.wait_for_selector(
         catalog.item, state="attached", timeout=CATALOG_ATTACH_TIMEOUT_MS
     )
-    # 融合共享课: 默认折叠的目录需先展开, 否则 get_filtered_class 采不全课时。
+    # 融合共享课: 默认折叠的章节其课时行是 display:none(Playwright 点不到),
+    # 先展开全部章节, 否则课时切换会一直超时。
     if catalog.name == "fusion":
         await FusionAdapter.expand_catalog(page)
         await page.wait_for_timeout(400)
@@ -114,13 +114,6 @@ async def run_course(
     for index, lesson in enumerate(lessons):
         position = f"{index + 1}/{len(lessons)}"
         playback_enabled.clear()
-        click_target, click_error = await resolve_lesson_click_target(lesson, catalog)
-        if click_target is None:
-            logger.error(f"无法选中课时,目录类型: {catalog.name}")
-            logger.event(
-                "课程结果", 结果="课时无法选中", 序号=position, 原因=click_error
-            )
-            return CourseOutcome.FAILED
         # 切换前先固定基准: 目标课时是否已激活 + 当前 <video> 的媒体状态。
         # 播放器会复用同一个 video 元素, 切换瞬间仍带着上一课时的 duration/currentTime,
         # 不记录基准就无法分辨"新课时媒体已加载"与"上一课时的残留元数据"。
@@ -136,7 +129,7 @@ async def run_course(
         elif await blocking_modal_visible(page):
             logger.warn("存在无法关闭的遮罩弹窗,课时可能点不动.", shift=True)
             logger.event("拦截弹窗", 序号=position, 结果="无法关闭")
-        clicked = await click_lesson_target(click_target, position, logger)
+        clicked = await click_lesson_target(lesson, position, logger)
         active = clicked and await wait_for_lesson_active(lesson, catalog)
         if not active:
             logger.warn("课时切换超时,正在重试一次.", shift=True)
@@ -150,7 +143,7 @@ async def run_course(
             closed = await close_blocking_modal(page)
             if closed:
                 logger.event("拦截弹窗", 序号=position, 关闭数=closed, 阶段="重试前")
-            clicked = await click_lesson_target(click_target, position, logger)
+            clicked = await click_lesson_target(lesson, position, logger)
             active = clicked and await wait_for_lesson_active(lesson, catalog)
         if not active:
             logger.error(f"无法选中课时,目录类型: {catalog.name}")

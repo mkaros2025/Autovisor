@@ -4,6 +4,7 @@ from playwright.async_api import Page, TimeoutError
 from modules.lesson_navigation import (
     CatalogSelectors,
     lesson_progress,
+    lesson_unit_selector,
     parse_progress_value,
 )
 from modules.logger import Logger
@@ -31,7 +32,8 @@ async def move_mouse(page: Page):
 # 获取课程进度
 async def get_course_progress(page: Page, catalog: CatalogSelectors) -> str:
     await move_mouse(page)
-    current_lesson = page.locator(catalog.active).first
+    # 融合课的当前课时可能是小节里的课时行, 不能只用 catalog.active(catalog.active 为 None)
+    current_lesson = page.locator(lesson_unit_selector(catalog)).first
     if await current_lesson.count() == 0:
         return "0%"
     return f"{await lesson_progress(current_lesson, catalog)}%"

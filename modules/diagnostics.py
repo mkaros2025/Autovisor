@@ -9,6 +9,8 @@ from modules.lesson_navigation import (
     CATALOGS,
     detect_catalog,
     get_lesson_title,
+    iter_lessons,
+    lesson_is_active,
     lesson_is_complete,
     lesson_progress,
 )
@@ -101,12 +103,17 @@ async def check_course(course_url: str, config, logger, cookie_path: str) -> int
                 name: await page.locator(selector).count()
                 for name, selector in selectors.items()
             }
-            lessons = await page.locator(catalog.item).all()
+            # 融合课的 item 是小节, 可含多个课时行: 这里也按课时单元统计
+            lessons = await iter_lessons(page, catalog)
             completed_count = sum(
                 [await lesson_is_complete(lesson, catalog) for lesson in lessons]
             )
-            active = page.locator(catalog.active).first
-            if await active.count():
+            active = None
+            for lesson in lessons:
+                if await lesson_is_active(lesson, catalog):
+                    active = lesson
+                    break
+            if active is not None:
                 active_title = await get_lesson_title(page, active, catalog)
                 active_progress = await lesson_progress(active, catalog)
             else:

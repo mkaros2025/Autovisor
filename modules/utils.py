@@ -10,6 +10,7 @@ from modules.configs import Config
 from modules.lesson_navigation import (
     CatalogSelectors,
     get_lesson_title,
+    iter_lessons,
     lesson_is_complete,
 )
 import time
@@ -379,7 +380,10 @@ async def get_filtered_class(
     except TimeoutError:
         pass
 
-    all_class = await page.locator(catalog.item).all()
+    # 融合课的 item(.chapter-item) 是小节, 可含多个课时行: 由 iter_lessons 展开成
+    # 真正的课时单元(无子课时的小节自身即课时), 否则小节级的 finish-icon 会被
+    # 当成整节完成, 漏掉同小节内未学的课时。
+    all_class = await iter_lessons(page, catalog)
     if include_all:
         logger.debug(f"Get to-review class: {len(all_class)}")
         return all_class

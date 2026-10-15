@@ -368,16 +368,13 @@ class LessonMediaWaitTests(unittest.IsolatedAsyncioTestCase):
 class RunCourseIntegrationTests(unittest.IsolatedAsyncioTestCase):
     """run_course 必须把确认过的时长与快照传给播放入口。"""
 
-    def _patches(self, learn_or_review, filtered, media_result):
+    def _patches(self, learn_or_review, media_result, learning=True):
         lesson = _FakeLesson()
+        filtered = [[lesson]] if learning else [[], [lesson]]
         return lesson, [
             patch(
                 "modules.course_runner.get_filtered_class",
                 new=AsyncMock(side_effect=filtered),
-            ),
-            patch(
-                "modules.course_runner.resolve_lesson_click_target",
-                new=AsyncMock(return_value=(lesson, None)),
             ),
             patch(
                 "modules.course_runner.lesson_is_active",
@@ -419,7 +416,7 @@ class RunCourseIntegrationTests(unittest.IsolatedAsyncioTestCase):
     async def test_learning_path_receives_verified_duration(self):
         validated = snapshot(duration=496.6, element=3, meta=2)
         lesson, patches = self._patches(
-            "learn_lesson", [[object()]], (496.6, 1.5, validated)
+            "learn_lesson", (496.6, 1.5, validated), learning=True
         )
         for p in patches:
             p.start()
@@ -433,12 +430,13 @@ class RunCourseIntegrationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(
             runner.learn_lesson.await_args.args[-2:], (496.6, validated)
         )
+        # 采集出来的课时单元本身就是点击目标(不再有容器/课时行的二次解析)
+        self.assertEqual(lesson.clicked, 1)
 
     async def test_review_path_receives_verified_duration(self):
         validated = snapshot(duration=372.2, element=1, meta=3)
-        lesson = _FakeLesson()
-        _, patches = self._patches(
-            "review_lesson", [[], [lesson]], (372.2, 0.0, validated)
+        lesson, patches = self._patches(
+            "review_lesson", (372.2, 0.0, validated), learning=False
         )
         for p in patches:
             p.start()
@@ -452,9 +450,12 @@ class RunCourseIntegrationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(
             runner.review_lesson.await_args.args[-2:], (372.2, validated)
         )
+        self.assertEqual(lesson.clicked, 1)
 
     async def test_unconfirmed_media_stops_the_run(self):
-        lesson, patches = self._patches("learn_lesson", [[object()]], (None, 0.0, None))
+        lesson, patches = self._patches(
+            "learn_lesson", (None, 0.0, None), learning=True
+        )
         for p in patches:
             p.start()
             self.addCleanup(p.stop)

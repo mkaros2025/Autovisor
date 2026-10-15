@@ -8,33 +8,43 @@ from modules.lesson_navigation import (
     WISDOM_CATALOG,
     catalog_candidates,
     has_class,
+    iter_lessons,
+    lesson_is_active,
+    lesson_unit_selector,
     parse_progress_value,
-    resolve_lesson_click_target,
 )
 
 
 class _FakeLocator:
-    """只实现 resolve_lesson_click_target 用到的 count() / first。"""
+    """只实现 iter_lessons / lesson_is_active 用到的接口。"""
 
-    def __init__(self, count=0):
-        self._count = count
+    def __init__(self, rows=None, class_attr=None):
+        self._rows = list(rows or [])
+        self._class_attr = class_attr
+
+    async def all(self):
+        return list(self._rows)
+
+    async def get_attribute(self, name):
+        return self._class_attr if name == "class" else None
 
     async def count(self):
-        return self._count
-
-    @property
-    def first(self):
-        return self
+        return len(self._rows)
 
 
-class _FakeLesson:
-    """课时项容器: locator(内部选择器) 返回预设的课时行。"""
-
-    def __init__(self, rows_count):
-        self.rows = _FakeLocator(rows_count)
+class _FakeItem(_FakeLocator):
+    """小节/课时项: locator(内部选择器) 返回它自己的课时行。"""
 
     def locator(self, selector):
-        return self.rows
+        return _FakeLocator(self._rows)
+
+
+class _FakePage:
+    def __init__(self, items):
+        self._items = list(items)
+
+    def locator(self, selector):
+        return _FakeLocator(self._items)
 
 
 class LessonNavigationTests(unittest.TestCase):
@@ -73,51 +83,59 @@ class LessonNavigationTests(unittest.TestCase):
         self.assertTrue(has_class("child-info current cur hasvideo", "current"))
         self.assertFalse(has_class("child-info current-next", "current"))
 
-    def test_fusion_click_target_is_the_lesson_row_not_the_container(self):
-        # 真站实测: .chapter-item 中心落在小节标题与课时行之间的空隙上,
-        # 点容器不切换课时(既不报错也不生效), 必须点 .chapter-content-second。
+    def test_fusion_lessons_are_the_rows_inside_the_section(self):
+        # 真站(render 函数 + DOM 快照)实测: .chapter-item 是"小节", 其下的
+        # .chapter-content-second 才是课时行(x.y.z); 一个小节可挂多个课时
+        # (4.3 培养心理韧性 4 个, 6.4 功夫在诗外 2 个), 不含行的小节自身即课时。
         self.assertEqual(FUSION_CATALOG.item, ".chapter-item")
-        self.assertEqual(FUSION_CATALOG.click, ".chapter-content-second")
+        self.assertEqual(FUSION_CATALOG.lesson_row, ".chapter-content-second")
+        # current 挂在课时单元自身, 不需要内部后代回退
+        self.assertIsNone(FUSION_CATALOG.active)
 
-    def test_only_fusion_declares_a_click_target(self):
+    def test_only_fusion_declares_inner_lesson_rows(self):
         for catalog in (WISDOM_CATALOG, LEGACY_CATALOG, HIKE_CATALOG):
             with self.subTest(catalog=catalog.name):
-                self.assertIsNone(catalog.click)
+                self.assertIsNone(catalog.lesson_row)
 
-    def test_click_target_is_the_single_inner_row(self):
-        lesson = _FakeLesson(rows_count=1)
-        target, error = asyncio.run(
-            resolve_lesson_click_target(lesson, FUSION_CATALOG)
+    def test_iter_lessons_expands_rows_and_keeps_rowless_sections(self):
+        rowless = _FakeItem(rows=[])
+        multi = _FakeItem(rows=["4.3.1", "4.3.2", "4.3.3", "4.3.4"])
+        single = _FakeItem(rows=["7.1.1"])
+        page = _FakePage([rowless, multi, single])
+
+        lessons = asyncio.run(iter_lessons(page, FUSION_CATALOG))
+
+        self.assertEqual(
+            lessons, [rowless, "4.3.1", "4.3.2", "4.3.3", "4.3.4", "7.1.1"]
         )
-        self.assertIsNone(error)
-        self.assertIs(target, lesson.rows)
 
-    def test_click_target_falls_back_to_container_when_row_is_absent(self):
-        lesson = _FakeLesson(rows_count=0)
-        target, error = asyncio.run(
-            resolve_lesson_click_target(lesson, FUSION_CATALOG)
-        )
-        self.assertIsNone(error)
-        self.assertIs(target, lesson)
+    def test_iter_lessons_returns_items_for_single_unit_catalogs(self):
+        items = [_FakeItem(rows=["x"]), _FakeItem(rows=[])]
+        page = _FakePage(items)
 
-    def test_click_target_rejects_ambiguous_rows(self):
-        # 多个子行时不猜 .first, 宁可明确失败, 避免点错课时
-        lesson = _FakeLesson(rows_count=3)
-        target, error = asyncio.run(
-            resolve_lesson_click_target(lesson, FUSION_CATALOG)
-        )
-        self.assertIsNone(target)
-        self.assertIn("3", error)
-
-    def test_catalogs_without_click_target_still_click_the_item(self):
-        lesson = _FakeLesson(rows_count=1)
         for catalog in (WISDOM_CATALOG, LEGACY_CATALOG, HIKE_CATALOG):
             with self.subTest(catalog=catalog.name):
-                target, error = asyncio.run(
-                    resolve_lesson_click_target(lesson, catalog)
-                )
-                self.assertIsNone(error)
-                self.assertIs(target, lesson)
+                self.assertEqual(asyncio.run(iter_lessons(page, catalog)), items)
+
+    def test_lesson_is_active_reads_the_unit_class(self):
+        row = _FakeItem(rows=[], class_attr="chapter-content-second current")
+        idle = _FakeItem(rows=[], class_attr="chapter-content-second")
+
+        self.assertTrue(asyncio.run(lesson_is_active(row, FUSION_CATALOG)))
+        self.assertFalse(asyncio.run(lesson_is_active(idle, FUSION_CATALOG)))
+
+    def test_active_unit_selector_covers_the_unit_for_every_catalog(self):
+        self.assertEqual(
+            lesson_unit_selector(FUSION_CATALOG),
+            ".chapter-content-second.current, .chapter-item.current",
+        )
+        self.assertEqual(
+            lesson_unit_selector(WISDOM_CATALOG), ".child-info.hasvideo.current"
+        )
+        self.assertEqual(lesson_unit_selector(HIKE_CATALOG), ".file-item.active")
+        self.assertEqual(
+            lesson_unit_selector(LEGACY_CATALOG), ".clearfix.video.current_play"
+        )
 
 
 if __name__ == "__main__":

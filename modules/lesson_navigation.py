@@ -9,17 +9,19 @@ from playwright.async_api import Locator, Page, TimeoutError
 class CatalogSelectors:
     name: str
     item: str
-    active: str
+    active: str | None
     finish: str
     title: str
     active_class: str
     progress: str | None = None
     progress_attribute: str | None = None
     course_title: str | None = None
-    # 真正可点击的课时行。item 是课时项的容器, 其中心点未必落在可点击区域
-    # (融合课的 .chapter-item 中心落在小节标题与课时行之间的空隙, 点它不会切换课时),
-    # 因此需要单独声明点击目标; 为 None 时直接点击 item。
-    click: str | None = None
+    # item 内部真正的"课时行"。融合课的 item(.chapter-item) 是**小节**, 一个小节可以挂
+    # 1~N 个课时行(.chapter-content-second, 如 4.3 有 4 个、6.4 有 2 个); 声明该字段后
+    # 采集课时会先把每个 item 展开成它的课时行, 而没有行的小节(平台数据
+    # ishaveChildrenLesson==0, 小节自身就是课时)仍以 item 本身作为课时。
+    # 其余目录一个 item 就是一个课时, 保持 None。
+    lesson_row: str | None = None
 
 
 WISDOM_CATALOG = CatalogSelectors(
@@ -36,22 +38,26 @@ WISDOM_CATALOG = CatalogSelectors(
 
 FUSION_CATALOG = CatalogSelectors(
     name="fusion",
-    # 真实融合课小节的容器是 .chapter-item(完整课时列表, 含 finish-icon);
-    # .chapter-content-second 只是"当前展开层级的子节点"(真站实测仅 4/58),
-    # 用它会漏采大部分课时, 故校准为 .chapter-item。
+    # 目录锚点仍用 .chapter-item(小节): 它一定存在, 与章节展开状态无关。
     item=".chapter-item",
-    active=".chapter-content-second.current",
+    # 真站实测(render 函数 + DOM 快照): .chapter-item 是**小节**,
+    # 其下的 .chapter-content-second 才是**课时行**——小节标题行显示 x.y,
+    # 课时行显示 x.y.z。一个小节可以挂多个课时行(4.3 培养心理韧性 4 个,
+    # 6.4 功夫在诗外 2 个); 平台自己的"未完成视频"统计也是
+    # "有子课时就看子课时, 没有才看小节"。故课时单位必须取课时行,
+    # 否则多课时小节点不动、也会漏学(小节级 finish-icon 只反映"小节的某个子课时" 已完成)。
+    lesson_row=".chapter-content-second",
+    # current 直接挂在小节/课时行自身(小节: class="chapter-item current",
+    # 课时行: class="chapter-content-second current"), 无需再找内部后代。
+    active=None,
     finish=".finish-icon",
     title=".item-name",
     active_class="current",
-    # 融合课每课时带一个圆形进度环 .el-progress(在 item 内部),
-    # aria-valuenow 给出真实已学百分比(缓增, 而非只到 0/100)。
-    # 补上后 lesson_progress 能读到中间值, 支撑"播完未到100->回退重播"上报。
+    # 进度环 .el-progress 就在课时行(或无可展开子课时的小节)内部,
+    # aria-valuenow 给出该课时真实的已学百分比(缓增, 而非只到 0/100),
+    # 支撑"播完未到 100 -> 回退重播"的上报。
     progress=".el-progress",
     progress_attribute="aria-valuenow",
-    # 真站实测: .chapter-item = 小节标题(.item-box) + 课时行(.chapter-content-second),
-    # 容器中心落在两行之间的空隙上, 点击容器不会切换课时; 必须点课时行本身。
-    click=".chapter-content-second",
 )
 
 HIKE_CATALOG = CatalogSelectors(
@@ -123,6 +129,37 @@ async def detect_catalog(
     )
 
 
+async def iter_lessons(page: Page, catalog: CatalogSelectors) -> list[Locator]:
+    """按目录顺序采集可播课时单元。
+
+    catalog.lesson_row 为 None 时 item 就是课时; 否则把每个 item 展开成它的课时行
+    (一个小节可能挂多个课时), 而没有课时行的小节自身就是课时
+    (真站数据 ishaveChildrenLesson==0, 渲染成 .item-box 一行, 点它就是播它自己的视频)。
+    """
+    items = await page.locator(catalog.item).all()
+    if not catalog.lesson_row:
+        return items
+
+    lessons: list[Locator] = []
+    for item in items:
+        rows = await item.locator(catalog.lesson_row).all()
+        lessons.extend(rows or [item])
+    return lessons
+
+
+def lesson_unit_selector(catalog: CatalogSelectors) -> str:
+    """当前激活的课时单元选择器。
+
+    课时单元可能是 item 内的课时行(融合课), 也可能是 item 自身, 两者都把 active_class
+    挂在自己身上, 这里统一成一个选择器供需要"当前课时"的调用方使用。
+    """
+    class_selector = f".{catalog.active_class}"
+    selectors = [f"{catalog.item}{class_selector}"]
+    if catalog.lesson_row:
+        selectors.insert(0, f"{catalog.lesson_row}{class_selector}")
+    return ", ".join(selectors)
+
+
 async def lesson_progress(lesson: Locator, catalog: CatalogSelectors) -> int:
     if await lesson.locator(catalog.finish).count() > 0:
         return 100
@@ -154,36 +191,11 @@ async def wait_for_lesson_completion(
     return False
 
 
-async def resolve_lesson_click_target(
-    lesson: Locator, catalog: CatalogSelectors
-) -> tuple[Locator | None, str | None]:
-    """返回真正可点击的课时元素。
-
-    item 只是课时项的容器: 融合课的 .chapter-item 中心落在小节标题(.item-box)与
-    课时行(.chapter-content-second)之间的空隙上, 点击容器不会切换课时(既不报错也不生效),
-    会让 wait_for_lesson_active 超时。catalog.click 命中恰好 1 个子元素时改点它;
-    未命中时保持原行为点容器; 命中多个时明确失败, 避免点错课时。
-    """
-    if not catalog.click:
-        return lesson, None
-    rows = lesson.locator(catalog.click)
-    try:
-        count = await rows.count()
-    except Exception as exc:
-        return None, f"统计课时行失败({catalog.click}): {exc}"
-    if count == 1:
-        return rows.first, None
-    if count == 0:
-        return lesson, None
-    return None, f"课时项内匹配到 {count} 个 {catalog.click}, 无法确定点击目标"
-
-
 async def lesson_is_active(lesson: Locator, catalog: CatalogSelectors) -> bool:
     """课时当前是否处于激活状态。
 
-    一些目录结构(如融合课)的"当前激活"标识挂在课时内部子节点上
-    (例如 .chapter-item 内的 .chapter-content-second.current), 课时自身无 active class,
-    因此除了检查本节点 active_class, 还需回退检查内部是否命中 catalog.active。
+    "当前激活"在课时单元自身(class="... current")上; 个别目录结构(如旧版)还会把标识
+    挂在课时内部子节点上, 因此本节点没命中时再回退查内部是否命中 catalog.active。
     """
     try:
         if has_class(await lesson.get_attribute("class"), catalog.active_class):
